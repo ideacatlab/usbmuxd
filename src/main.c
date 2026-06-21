@@ -60,6 +60,7 @@ static const char *lockfile = DEFAULT_LOCKFILE;
 // Global state used in other files
 int should_exit;
 int should_discover;
+int should_rearm;
 int use_logfile = 0;
 int no_preflight = 0;
 
@@ -271,8 +272,13 @@ static void handle_signal(int sig)
 				usbmuxd_log(LL_INFO, "Caught SIGUSR2, scheduling device discovery");
 				should_discover = 1;
 			}
+		} else if (sig == SIGUSR2) {
+			/* ALI: SIGUSR2 = re-arm device modes (SET_MODE 1->2) for a clean QVH/WDA re-arm
+			 * without a reboot. Safe to repurpose: SIGUSR2 was a no-op without --enable-exit. */
+			usbmuxd_log(LL_INFO, "Caught SIGUSR2, scheduling device mode re-arm");
+			should_rearm = 1;
 		} else {
-			usbmuxd_log(LL_INFO, "Caught SIGUSR1/2 but this instance was not started with \"--enable-exit\", ignoring.");
+			usbmuxd_log(LL_INFO, "Caught SIGUSR1 but this instance was not started with \"--enable-exit\", ignoring.");
 		}
 	}
 }
@@ -354,6 +360,11 @@ static int main_loop(int listenfd)
 					should_discover = 0;
 					usbmuxd_log(LL_INFO, "Device discovery triggered");
 					usb_discover();
+				}
+				if(should_rearm) {
+					should_rearm = 0;
+					usbmuxd_log(LL_INFO, "Device mode re-arm triggered (SIGUSR2)");
+					usb_rearm_all_modes();
 				}
 			}
 		} else if(cnt == 0) {

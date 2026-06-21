@@ -66,6 +66,7 @@ void usb_get_fds(struct fdlist *list);
 int usb_get_timeout(void);
 int usb_send(struct usb_device *dev, const unsigned char *buf, int length);
 int usb_discover(void);
+void usb_rearm_all_modes(void);
 void usb_autodiscover(int enable);
 int usb_process(void);
 int usb_process_timeout(int msec);

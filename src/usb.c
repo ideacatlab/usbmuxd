@@ -734,6 +734,52 @@ static void get_mode_cb(struct libusb_transfer* transfer)
 		free(transfer->buffer);
 }
 
+/* ALI ResetDeviceMode: re-arm a device ALREADY in mode 2 (config 5) so it re-emits the AV
+ * start-clock (CWPA) for a clean QVH/WDA arm WITHOUT rebooting the phone. A SET_MODE vendor
+ * request is IGNORED while config 5 is claimed (verified: devices stay on config 5), so we do a
+ * USB PORT RESET instead: libusb_reset_device() is a virtual re-plug -> the device re-enumerates ->
+ * usbmuxd's normal usb_device_add -> get_mode_cb path puts it back on mode 2 (fresh config-4->5
+ * transition -> CWPA). Triggered per-instance by SIGUSR2 (see main.c). */
+static int reset_device_mode(struct usb_device *usbdev)
+{
+	int res;
+	usbmuxd_log(LL_WARNING, "ResetDeviceMode: device %i-%i USB port reset (re-arm)", usbdev->bus, usbdev->address);
+	res = libusb_reset_device(usbdev->handle);
+	if(res == LIBUSB_ERROR_NOT_FOUND) {
+		/* device re-enumerated under a new address; old handle is dead, hotplug re-adds it */
+		usbdev->alive = 0;
+		res = 0;
+	} else if(res != 0) {
+		usbmuxd_log(LL_ERROR, "ResetDeviceMode: reset failed for %i-%i (%s)", usbdev->bus, usbdev->address, libusb_error_name(res));
+	}
+	return res;
+}
+
+void usb_rearm_all_modes(void)
+{
+	/* Per-device targeting: if /tmp/usbmuxd-rearm-serial holds a UDID/serial, re-arm ONLY that
+	 * device (resetting all 27 at once knocks out the whole fleet). Empty/missing file = all. */
+	char target[80] = {0};
+	int n = 0;
+	FILE *f = fopen("/tmp/usbmuxd-rearm-serial", "r");
+	if(f) {
+		if(fgets(target, sizeof(target), f)) {
+			char *nl = strpbrk(target, "\r\n");
+			if(nl) *nl = 0;
+		}
+		fclose(f);
+	}
+	FOREACH(struct usb_device *usbdev, &device_list) {
+		if(usbdev->alive && usbdev->handle) {
+			if(target[0] && strcmp(usbdev->serial, target) != 0)
+				continue; /* only the requested serial */
+			if(reset_device_mode(usbdev) == 0)
+				n++;
+		}
+	} ENDFOREACH
+	usbmuxd_log(LL_WARNING, "ResetDeviceMode: re-arm submitted for %i device(s)%s%s", n, target[0] ? ", target=" : " (all)", target);
+}
+
 static int usb_device_add(libusb_device* dev)
 {
 	int res;
