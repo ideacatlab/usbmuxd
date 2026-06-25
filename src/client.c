@@ -302,8 +302,19 @@ void client_close(struct mux_client *client)
 void client_get_fds(struct fdlist *list)
 {
 	mutex_lock(&client_list_mutex);
+	// ALI fix C (razvan/v2-loop-fix): service CONTROL clients before BULK relay
+	// clients. usbmuxd runs ONE ppoll loop for everyone; a small control request
+	// (lockdown / idevicepair / the pod's WDA-health probes) must not queue behind
+	// a backlog of high-bandwidth CONNECTED MJPEG stream relays in the same pass.
+	// Enqueue non-CONNECTED (command/listen/connecting) fds first, then the
+	// CONNECTED bulk fds, so the FD walk reaches control traffic first.
 	FOREACH(struct mux_client *client, &client_list) {
-		fdlist_add(list, FD_CLIENT, client->fd, client->events);
+		if(client->state != CLIENT_CONNECTED)
+			fdlist_add(list, FD_CLIENT, client->fd, client->events);
+	} ENDFOREACH
+	FOREACH(struct mux_client *client, &client_list) {
+		if(client->state == CLIENT_CONNECTED)
+			fdlist_add(list, FD_CLIENT, client->fd, client->events);
 	} ENDFOREACH
 	mutex_unlock(&client_list_mutex);
 }
