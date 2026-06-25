@@ -318,30 +318,19 @@ static void connection_teardown(struct mux_connection *conn)
 			conn->state = CONN_DEAD;
 			if((conn->events & POLLOUT) && conn->ib_size > 0){
 				usbmuxd_log(LL_DEBUG, "%s: flushing buffer to client (%u bytes)", __func__, conn->ib_size);
-				uint64_t tm_last = mstime64();
-				while(1){
-					size = client_write(conn->client, conn->ib_buf, conn->ib_size);
-					if(size < 0) {
-						usbmuxd_log(LL_ERROR, "%s: aborting buffer flush to client after error.", __func__);
-						break;
-					} else if (size == 0) {
-						uint64_t tm_now = mstime64();
-						if (tm_now - tm_last > 1000) {
-							usbmuxd_log(LL_ERROR, "%s: aborting buffer flush to client after unsuccessfully attempting for %dms.", __func__, (int)(tm_now - tm_last));
-							break;
-						}
-						usleep(10000);
-						continue;
-					}
-					if(size == (int)conn->ib_size) {
-						conn->ib_size = 0;
-						break;
-					} else {
-						conn->ib_size -= size;
-						memmove(conn->ib_buf, conn->ib_buf + size, conn->ib_size);
-					}
-					tm_last = mstime64();
-				}
+				// ALI fix (razvan/v2-loop-fix): NON-BLOCKING teardown flush. usbmuxd services
+				// every device on ONE ppoll thread; the original loop busy-waited up to 1000ms
+				// (usleep) draining a dying connection whose client socket wasn't writable (a
+				// slow / broken-pipe MJPEG consumer), freezing ALL other devices' control probes
+				// (WDA /status, idevicepair) for that whole second and cascading into false-
+				// detach storms. Leftover bytes are stale MJPEG frames: ONE best-effort
+				// non-blocking write, drop the rest, never spin.
+				size = client_write(conn->client, conn->ib_buf, conn->ib_size);
+				if(size < 0)
+					usbmuxd_log(LL_DEBUG, "%s: dropping client buffer flush after write error.", __func__);
+				else if(size < (int)conn->ib_size)
+					usbmuxd_log(LL_DEBUG, "%s: dropped %u undeliverable bytes on teardown.", __func__, (unsigned int)(conn->ib_size - size));
+				conn->ib_size = 0;
 			}
 			client_close(conn->client);
 		}
