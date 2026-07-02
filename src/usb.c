@@ -45,6 +45,14 @@
 // interval for device connection/disconnection polling, in milliseconds
 // we need this because there is currently no asynchronous device discovery mechanism in libusb
 #define DEVICE_POLL_TIME 1000
+// Reconciliation cadence used INSTEAD of disabling polling when libusb
+// hotplug registers (see usb_init): a transfer-error-reaped device whose
+// kernel entry never re-enumerates gets NO hotplug ARRIVED event, so without
+// a periodic usb_discover() sweep it is lost until a daemon restart (the
+// hours-long "device not found on usbmuxd" class). Overridable via the
+// USBMUXD_RECONCILE_MS environment variable; 0 restores the upstream
+// hotplug-only behavior.
+#define DEVICE_RECONCILE_TIME_DEFAULT 5000
 
 // Number of parallel bulk transfers we have running for reading data from the device.
 // Older versions of usbmuxd kept only 1, which leads to a mostly dormant USB port.
@@ -78,6 +86,7 @@ static struct collection device_list;
 static struct timeval next_dev_poll_time;
 
 static int devlist_failures;
+static int dev_poll_interval_ms = DEVICE_POLL_TIME;
 static int device_polling;
 static int device_hotplug = 1;
 
@@ -275,6 +284,11 @@ static void get_serial_callback(struct libusb_transfer *transfer)
 
 	if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
 		usbmuxd_log(LL_ERROR, "Failed to request serial for device %d-%d (%i)", usbdev->bus, usbdev->address, transfer->status);
+		// Un-zombie: without this the device stays alive-but-uninitialized
+		// forever (never reaches device_add, blocks re-add at this address).
+		// Marking it dead lets the reaper clean it and the reconciliation
+		// sweep re-init it on the next pass.
+		usbdev->alive = 0;
 		libusb_free_transfer(transfer);
 		return;
 	}
@@ -345,6 +359,8 @@ static void get_langid_callback(struct libusb_transfer *transfer)
 	if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
 		 usbmuxd_log(LL_ERROR, "Failed to request lang ID for device %d-%d (%i)", usbdev->bus,
 				 usbdev->address, transfer->status);
+		 // Un-zombie (see get_serial_callback).
+		 usbdev->alive = 0;
 		 libusb_free_transfer(transfer);
 		 return;
 	}
@@ -868,11 +884,18 @@ int usb_discover(void)
 		devlist_failures++;
 		// sometimes libusb fails getting the device list if you've just removed something
 		if(devlist_failures > 5) {
-			usbmuxd_log(LL_FATAL, "Too many errors getting device list");
+			// Not fatal: during hub-reset storms the list can fail repeatedly;
+			// killing discovery here would strand every error-reaped device
+			// until a daemon restart. Back off and keep reconciling.
+			usbmuxd_log(LL_ERROR, "Too many errors getting device list — backing off");
+			get_tick_count(&next_dev_poll_time);
+			next_dev_poll_time.tv_usec += (dev_poll_interval_ms * 6) * 1000;
+			next_dev_poll_time.tv_sec += next_dev_poll_time.tv_usec / 1000000;
+			next_dev_poll_time.tv_usec = next_dev_poll_time.tv_usec % 1000000;
 			return cnt;
 		} else {
 			get_tick_count(&next_dev_poll_time);
-			next_dev_poll_time.tv_usec += DEVICE_POLL_TIME * 1000;
+			next_dev_poll_time.tv_usec += dev_poll_interval_ms * 1000;
 			next_dev_poll_time.tv_sec += next_dev_poll_time.tv_usec / 1000000;
 			next_dev_poll_time.tv_usec = next_dev_poll_time.tv_usec % 1000000;
 			return 0;
@@ -904,7 +927,7 @@ int usb_discover(void)
 	libusb_free_device_list(devs, 1);
 
 	get_tick_count(&next_dev_poll_time);
-	next_dev_poll_time.tv_usec += DEVICE_POLL_TIME * 1000;
+	next_dev_poll_time.tv_usec += dev_poll_interval_ms * 1000;
 	next_dev_poll_time.tv_sec += next_dev_poll_time.tv_usec / 1000000;
 	next_dev_poll_time.tv_usec = next_dev_poll_time.tv_usec % 1000000;
 
@@ -1108,7 +1131,23 @@ int usb_init(void)
 		usbmuxd_log(LL_INFO, "Registering for libusb hotplug events");
 		res = libusb_hotplug_register_callback(NULL, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED | LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT, LIBUSB_HOTPLUG_ENUMERATE, VID_APPLE, LIBUSB_HOTPLUG_MATCH_ANY, 0, usb_hotplug_cb, NULL, &usb_hotplug_cb_handle);
 		if (res == LIBUSB_SUCCESS) {
-			device_polling = 0;
+			// Keep a slow reconciliation sweep running alongside hotplug:
+			// hotplug alone permanently loses devices that get transfer-error
+			// reaped without a kernel re-enumeration (no ARRIVED ever fires).
+			// usb_discover() is mark-and-sweep safe for known-alive devices
+			// (find_device lookup, no I/O to healthy phones).
+			int reconcile_ms = DEVICE_RECONCILE_TIME_DEFAULT;
+			const char *env = getenv("USBMUXD_RECONCILE_MS");
+			if (env && *env) {
+				reconcile_ms = atoi(env);
+			}
+			if (reconcile_ms > 0) {
+				dev_poll_interval_ms = reconcile_ms;
+				usbmuxd_log(LL_NOTICE, "Hotplug active + reconciliation sweep every %dms (USBMUXD_RECONCILE_MS)", dev_poll_interval_ms);
+			} else {
+				device_polling = 0;
+				usbmuxd_log(LL_NOTICE, "Hotplug active, reconciliation sweep disabled (USBMUXD_RECONCILE_MS=0)");
+			}
 		} else {
 			usbmuxd_log(LL_ERROR, "ERROR: Could not register for libusb hotplug events. %s", libusb_error_name(res));
 		}
