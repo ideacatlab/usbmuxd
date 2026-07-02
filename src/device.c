@@ -51,6 +51,13 @@ int next_device_id;
 #define CONN_OUTBUF_SIZE	65536
 
 #define ACK_TIMEOUT 30
+// MUXDEV_INIT version-handshake retry: a device that never answers the initial
+// MUX_PROTO_VERSION packet stays MUXDEV_INIT forever and is invisible to
+// clients (device_get_list only returns MUXDEV_ACTIVE). One dropped packet on
+// a congested bus was enough to strand a phone (observed: 217 "Connecting" vs
+// 216 "Connected"). Resend a few times before giving up.
+#define VERSION_RETRY_MS 2000
+#define VERSION_MAX_ATTEMPTS 5
 
 enum mux_protocol {
 	MUX_PROTO_VERSION = 0,
@@ -127,6 +134,8 @@ struct mux_device
 	int version;
 	uint16_t rx_seq;
 	uint16_t tx_seq;
+	uint64_t version_sent_at;  // mstime64 of the last MUX_PROTO_VERSION send (INIT retry)
+	int version_attempts;      // MUX_PROTO_VERSION sends so far (INIT retry)
 };
 
 static struct collection device_list;
@@ -842,6 +851,8 @@ int device_add(struct usb_device *usbdev)
 		free(dev);
 		return res;
 	}
+	dev->version_sent_at = mstime64();
+	dev->version_attempts = 1;
 	mutex_lock(&device_list_mutex);
 	collection_add(&device_list, dev);
 	mutex_unlock(&device_list_mutex);
@@ -972,6 +983,25 @@ void device_check_timeouts(void)
 	uint64_t ct = mstime64();
 	mutex_lock(&device_list_mutex);
 	FOREACH(struct mux_device *dev, &device_list) {
+		if(dev->state == MUXDEV_INIT &&
+		   (ct - dev->version_sent_at) > VERSION_RETRY_MS) {
+			if(dev->version_attempts >= VERSION_MAX_ATTEMPTS) {
+				usbmuxd_log(LL_ERROR, "Device %d never answered MUX_PROTO_VERSION after %d attempts — still invisible",
+					dev->id, dev->version_attempts);
+				dev->version_sent_at = ct; // stop hammering; log once per window
+			} else {
+				struct version_header vh;
+				vh.major = htonl(2);
+				vh.minor = htonl(0);
+				vh.padding = 0;
+				usbmuxd_log(LL_WARNING, "Device %d stuck in INIT — resending version packet (attempt %d/%d)",
+					dev->id, dev->version_attempts + 1, VERSION_MAX_ATTEMPTS);
+				if(send_packet(dev, MUX_PROTO_VERSION, &vh, NULL, 0) >= 0) {
+					dev->version_attempts++;
+				}
+				dev->version_sent_at = ct;
+			}
+		}
 		if(dev->state == MUXDEV_ACTIVE) {
 			FOREACH(struct mux_connection *conn, &dev->connections) {
 				if((conn->state == CONN_CONNECTED) &&

@@ -516,6 +516,13 @@ static int set_valid_configuration(struct libusb_device* dev, struct usb_device 
 	}
 
 	for(j = devdesc.bNumConfigurations ; j > 0  ; j--) {
+		// Reset per iteration: `found` sticks across j otherwise, so a config
+		// whose set_configuration FAILED (then `continue`) leaves found=1, and a
+		// later non-matching config skips its `if(!found) continue` guard and
+		// runs the config-change block with stale interface/endpoint values —
+		// returning "success" with the wrong config set (upstream #238, and a
+		// live MUXDEV_INIT-limbo cause on our pods).
+		found = 0;
 		if((res = libusb_get_config_descriptor_by_value(dev, j, &config)) != 0) {
 			usbmuxd_log(LL_NOTICE, "Could not get configuration %i descriptor for device %i-%i: %s", j, bus, address, libusb_error_name(res));
 			continue;
