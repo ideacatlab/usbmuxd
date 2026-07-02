@@ -108,11 +108,29 @@ static void usb_disconnect(struct usb_device *dev)
 		libusb_cancel_transfer(xfer);
 	} ENDFOREACH
 
-	// Busy-wait until all xfers are closed
+	// Wait for the cancelled xfers to close — BOUNDED. Upstream busy-waited
+	// here with NO cap: a wedged device whose URB cancellations never
+	// complete (hub-reset storms) froze the whole single-threaded daemon
+	// mid-operation, and blocked SIGTERM delivery on shutdown (the 90s
+	// systemd stop-timeout -> SIGKILL class). Cap at ~500 iterations
+	// (>=1ms each); on overrun LEAK the device instead of freeing it:
+	// late transfer callbacks still reference dev via user_data, so
+	// freeing would be a use-after-free — a few hundred KB leaked on a
+	// rare, already-broken teardown is the safe trade.
+	int teardown_iterations = 0;
 	while(collection_count(&dev->rx_xfers) || collection_count(&dev->tx_xfers)) {
 		struct timeval tv;
 		int res;
 
+		if(++teardown_iterations > 500) {
+			usbmuxd_log(LL_ERROR, "usb_disconnect: %d xfers still pending after %d iterations for device %d-%d — leaking device struct to avoid freezing the daemon",
+				collection_count(&dev->rx_xfers) + collection_count(&dev->tx_xfers), teardown_iterations - 1, dev->bus, dev->address);
+			// Make the slot re-usable: drop it from the visible list so a
+			// fresh usb_device_add for this location isn't blocked, but keep
+			// the struct + handle alive for the outstanding callbacks.
+			collection_remove(&device_list, dev);
+			return;
+		}
 		tv.tv_sec = 0;
 		tv.tv_usec = 1000;
 		if((res = libusb_handle_events_timeout(NULL, &tv)) < 0) {
